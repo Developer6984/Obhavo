@@ -2,38 +2,32 @@
 # -*- coding: utf-8 -*-
 """
 =================================================================================
- KO'P FUNKSIYALI TELEGRAM OB-HAVO BOTI
+ 🌈 KO'P FUNKSIYALI TELEGRAM OB-HAVO BOTI — v2.0 (PREMIUM UI)
  O'zbekiston va dunyo hududlari uchun mo'ljallangan
 =================================================================================
 
-Muallif rejasi (arxitektura):
-    - WeatherService        -> OpenWeatherMap orqali real vaqtdagi ob-havo
-    - SafetyAdvisor         -> ob-havoga qarab xavfsizlik ogohlantirishlari
-    - ClothingAdvisor       -> haroratga mos kiyim tavsiyalari
-    - CurrencyService       -> valyuta kurslari (USD/EUR/RUB -> UZS)
-    - QuoteFactService      -> kunning hikmatli so'zi / qiziqarli fakti
-    - TranslatorService     -> avtomatik tarjimon
-    - TodoManager           -> eslatmalar va to-do ro'yxati (SQLite)
-    - NewsService           -> yangiliklar lentasi
-    - MovieService          -> kino sharhlari (OMDb)
-    - BookService           -> kitob/audiokitob tavsiyalari (Google Books)
-    - SportsService         -> sport natijalari (TheSportsDB)
-    - PlaceFinderService    -> yaqin atrofdagi dorixona/do'kon (OpenStreetMap)
-    - TravelService         -> mashhur sayohat yo'nalishlari
-    - TrafficService        -> yo'l tirbandligi (stub, kelajakda kengaytiriladi)
+MUHIM: Bu versiya Render.com'da chiqqan quyidagi xatoliklarni TUZATISH uchun
+qayta yozilgan:
+    - "RuntimeError: There is no current event loop in thread 'MainThread'"
+    - "RuntimeWarning: coroutine 'Updater.start_webhook' was never awaited"
 
-    NAMOZ VAQTLARI integratsiyasi ataylab hozircha FAQAT KOMMENTARIYA sifatida
-    qoldirilgan (fayl oxiriga yaqin "PRAYER_TIMES_TODO" bo'limiga qarang).
+Sabab: eski kod tashqi `apscheduler.AsyncIOScheduler`ni QO'LDA event loop bilan
+ishga tushirayotgan edi va bu ba'zi hosting muhitlarida (Render kabi)
+asyncio loop bilan to'qnashib, botni "Exited with status 1" holatiga olib
+kelardi. YECHIM: bu versiyada tashqi scheduler UMUMAN ishlatilmaydi — buning
+o'rniga python-telegram-bot'ning O'ZINING ichki, xavfsiz `JobQueue`
+mexanizmidan foydalaniladi (application.job_queue.run_daily). Bundan tashqari,
+webhook bilan bog'liq HECH QANDAY kod yo'q — faqat sof `run_polling()`.
 
-Talab qilinadigan muhit o'zgaruvchilari (.env faylida):
-    TELEGRAM_BOT_TOKEN         - Telegram bot tokeni (majburiy)
-    OPENWEATHERMAP_API_KEY     - OpenWeatherMap API kaliti (majburiy)
-    NEWSAPI_KEY                - NewsAPI.org kaliti (ixtiyoriy)
-    OMDB_API_KEY                - OMDb API kaliti (ixtiyoriy)
-    GOOGLE_BOOKS_API_KEY        - Google Books API kaliti (ixtiyoriy)
-    THESPORTSDB_API_KEY        - TheSportsDB kaliti (ixtiyoriy, default "3")
-    TIMEZONE                   - masalan "Asia/Tashkent"
-    DB_PATH                     - SQLite fayl yo'li
+Arxitektura (servis-klasslar):
+    WeatherService, SafetyAdvisor, ClothingAdvisor, CurrencyService,
+    QuoteFactService, TranslatorService, TodoManager, NewsService,
+    MovieService, BookService, SportsService, PlaceFinderService,
+    TravelService, TrafficService (stub)
+
+    NAMOZ VAQTLARI integratsiyasi hali ham FAQAT KOMMENTARIYA sifatida
+    saqlangan (PRAYER_TIMES_TODO bo'limiga qarang) — talabga ko'ra hozircha
+    ishga tushirilmaydi.
 
 Ishga tushirish:
     pip install -r requirements.txt
@@ -51,7 +45,7 @@ import logging
 import random
 import asyncio
 import functools
-from datetime import datetime, timedelta
+from datetime import datetime, time as dtime
 from typing import Optional, List, Dict, Any, Tuple
 
 import requests
@@ -60,16 +54,15 @@ from dotenv import load_dotenv
 
 try:
     from deep_translator import GoogleTranslator
-except ImportError:  # kutubxona o'rnatilmagan bo'lsa, tarjimon funksiyasi o'chadi
+except ImportError:
     GoogleTranslator = None
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
     KeyboardButton,
+    ReplyKeyboardMarkup,
 )
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
@@ -79,13 +72,9 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
-    ConversationHandler,
     ContextTypes,
     filters,
 )
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-
 
 # =================================================================================
 # 1. SOZLAMALAR VA MUHIT O'ZGARUVCHILARI
@@ -98,47 +87,37 @@ OWM_API_KEY: Optional[str] = os.getenv("OPENWEATHERMAP_API_KEY")
 NEWSAPI_KEY: str = os.getenv("NEWSAPI_KEY", "")
 OMDB_API_KEY: str = os.getenv("OMDB_API_KEY", "")
 GOOGLE_BOOKS_API_KEY: str = os.getenv("GOOGLE_BOOKS_API_KEY", "")
-THESPORTSDB_API_KEY: str = os.getenv("THESPORTSDB_API_KEY", "3")  # "3" - ochiq test kaliti
+THESPORTSDB_API_KEY: str = os.getenv("THESPORTSDB_API_KEY", "3")
 TIMEZONE_NAME: str = os.getenv("TIMEZONE", "Asia/Tashkent")
 DB_PATH: str = os.getenv("DB_PATH", "bot_database.db")
 DAILY_BROADCAST_HOUR: int = int(os.getenv("DAILY_BROADCAST_HOUR", "8"))
 DAILY_BROADCAST_MINUTE: int = int(os.getenv("DAILY_BROADCAST_MINUTE", "0"))
 
 if not BOT_TOKEN:
-    raise RuntimeError(
-        "TELEGRAM_BOT_TOKEN topilmadi. .env faylida TELEGRAM_BOT_TOKEN='...' ko'rsating."
-    )
+    raise RuntimeError("❌ TELEGRAM_BOT_TOKEN topilmadi. .env faylini tekshiring.")
 if not OWM_API_KEY:
-    raise RuntimeError(
-        "OPENWEATHERMAP_API_KEY topilmadi. .env faylida OPENWEATHERMAP_API_KEY='...' ko'rsating."
-    )
+    raise RuntimeError("❌ OPENWEATHERMAP_API_KEY topilmadi. .env faylini tekshiring.")
 
 TZ = pytz.timezone(TIMEZONE_NAME)
 
 # =================================================================================
-# 2. LOGGING SOZLAMALARI
+# 2. LOGGING
 # =================================================================================
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     level=logging.INFO,
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("bot.log", encoding="utf-8"),
-    ],
+    handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler("bot.log", encoding="utf-8")],
 )
-# kutubxonalarning ortiqcha "debug" xabarlarini kamaytiramiz
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger("weather_bot")
 
+DEFAULT_TIMEOUT = 10
+
 
 # =================================================================================
-# 3. YORDAMCHI FUNKSIYALAR (HTTP so'rovlar, DB ishga tushirish)
+# 3. YORDAMCHI FUNKSIYALAR (HTTP + DB)
 # =================================================================================
-
-DEFAULT_TIMEOUT = 10  # soniya
-
 
 async def fetch_json(
     url: str,
@@ -146,85 +125,59 @@ async def fetch_json(
     headers: Optional[Dict[str, str]] = None,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Tashqi API'larga bloklanmaydigan (non-blocking) tarzda GET so'rov yuboradi.
-    `requests` kutubxonasi sinxron bo'lgani uchun uni alohida thread'da ishga
-    tushiramiz, shunda asyncio event loop bloklanib qolmaydi.
-    """
+    """Tashqi API'larga bloklanmaydigan (thread-executor) GET so'rov."""
     loop = asyncio.get_running_loop()
     try:
-        func = functools.partial(
-            requests.get, url, params=params, headers=headers, timeout=timeout
-        )
+        func = functools.partial(requests.get, url, params=params, headers=headers, timeout=timeout)
         response = await loop.run_in_executor(None, func)
         response.raise_for_status()
         return response.json()
     except requests.exceptions.Timeout:
-        logger.warning("So'rov vaqti tugadi (timeout): %s", url)
+        logger.warning("⏱ Timeout: %s", url)
     except requests.exceptions.HTTPError as e:
-        logger.warning("HTTP xatolik: %s -> %s", url, e)
+        logger.warning("🚫 HTTP xatolik: %s -> %s", url, e)
     except requests.exceptions.RequestException as e:
-        logger.warning("Tarmoq xatoligi: %s -> %s", url, e)
+        logger.warning("🌐 Tarmoq xatoligi: %s -> %s", url, e)
     except (ValueError, json.JSONDecodeError):
-        logger.warning("JSON parslashda xatolik: %s", url)
+        logger.warning("📄 JSON parslash xatoligi: %s", url)
     return None
 
 
 def init_database() -> None:
-    """SQLite bazasini va kerakli jadvallarni yaratadi (birinchi ishga tushganda)."""
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
         cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                chat_id INTEGER PRIMARY KEY,
-                username TEXT,
-                city TEXT,
-                lat REAL,
-                lon REAL,
-                lang TEXT DEFAULT 'uz',
-                subscribed_daily INTEGER DEFAULT 0,
-                created_at TEXT
-            )
-            """
+            """CREATE TABLE IF NOT EXISTS users (
+                chat_id INTEGER PRIMARY KEY, username TEXT, city TEXT,
+                lat REAL, lon REAL, lang TEXT DEFAULT 'uz',
+                subscribed_daily INTEGER DEFAULT 0, created_at TEXT)"""
         )
         cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS todos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                task TEXT NOT NULL,
-                is_done INTEGER DEFAULT 0,
-                created_at TEXT
-            )
-            """
+            """CREATE TABLE IF NOT EXISTS todos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
+                task TEXT NOT NULL, is_done INTEGER DEFAULT 0, created_at TEXT)"""
         )
         conn.commit()
-    logger.info("Ma'lumotlar bazasi tayyor: %s", DB_PATH)
+    logger.info("✅ Ma'lumotlar bazasi tayyor: %s", DB_PATH)
 
 
 def _db_execute(query: str, params: Tuple = (), fetch: bool = False) -> Any:
-    """Sinxron SQLite so'rovini bajaruvchi ichki funksiya (thread ichida chaqiriladi)."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute(query, params)
         if fetch:
-            rows = cur.fetchall()
-            return [dict(r) for r in rows]
+            return [dict(r) for r in cur.fetchall()]
         conn.commit()
         return cur.lastrowid
 
 
 async def db_execute(query: str, params: Tuple = (), fetch: bool = False) -> Any:
-    """`_db_execute` ni asosiy event loop'ni bloklamasdan chaqiradi."""
     loop = asyncio.get_running_loop()
-    func = functools.partial(_db_execute, query, params, fetch)
-    return await loop.run_in_executor(None, func)
+    return await loop.run_in_executor(None, functools.partial(_db_execute, query, params, fetch))
 
 
 async def upsert_user(chat_id: int, username: Optional[str] = None) -> None:
-    """Foydalanuvchini bazaga qo'shadi (mavjud bo'lsa, o'zgartirmaydi)."""
     existing = await db_execute("SELECT chat_id FROM users WHERE chat_id = ?", (chat_id,), fetch=True)
     if not existing:
         await db_execute(
@@ -251,49 +204,29 @@ async def get_all_subscribed_users() -> List[Dict[str, Any]]:
 
 
 # =================================================================================
-# 4. OB-HAVO XIZMATI (OpenWeatherMap) — HOZIRGI VAQTDAGI HARORAT
+# 4. OB-HAVO XIZMATI (real vaqtdagi harorat, OpenWeatherMap)
 # =================================================================================
 
 class WeatherService:
-    """
-    OpenWeatherMap "Current Weather Data" (data/2.5/weather) endpoint'i orqali
-    FAQAT hozirgi (real-time) ob-havo ma'lumotini oladi. Prognoz (forecast) ishlatilmaydi,
-    chunki talabga ko'ra faqat aniq hozirgi holat kerak.
-    """
-
     BASE_URL = "https://api.openweathermap.org/data/2.5/weather"
 
     def __init__(self, api_key: str):
         self.api_key = api_key
 
     async def get_by_city(self, city: str) -> Optional[Dict[str, Any]]:
-        params = {
-            "q": city,
-            "appid": self.api_key,
-            "units": "metric",
-            "lang": "uz",
-        }
-        data = await fetch_json(self.BASE_URL, params=params)
-        return self._parse(data)
+        params = {"q": city, "appid": self.api_key, "units": "metric", "lang": "uz"}
+        return self._parse(await fetch_json(self.BASE_URL, params=params))
 
     async def get_by_coords(self, lat: float, lon: float) -> Optional[Dict[str, Any]]:
-        params = {
-            "lat": lat,
-            "lon": lon,
-            "appid": self.api_key,
-            "units": "metric",
-            "lang": "uz",
-        }
-        data = await fetch_json(self.BASE_URL, params=params)
-        return self._parse(data)
+        params = {"lat": lat, "lon": lon, "appid": self.api_key, "units": "metric", "lang": "uz"}
+        return self._parse(await fetch_json(self.BASE_URL, params=params))
 
     @staticmethod
     def _parse(data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        """API javobini botga qulay formatga o'tkazadi."""
         if not data or data.get("cod") not in (200, "200"):
             return None
         try:
-            weather_block = data["weather"][0]
+            wb = data["weather"][0]
             return {
                 "city": data.get("name", "Noma'lum"),
                 "country": data.get("sys", {}).get("country", ""),
@@ -305,30 +238,26 @@ class WeatherService:
                 "pressure": data["main"]["pressure"],
                 "wind_speed": data.get("wind", {}).get("speed", 0),
                 "visibility_m": data.get("visibility", 10000),
-                "description": weather_block.get("description", "").capitalize(),
-                "main_condition": weather_block.get("main", ""),  # Rain, Snow, Clear, ...
-                "icon": weather_block.get("icon", ""),
-                "sunrise": data["sys"].get("sunrise"),
-                "sunset": data["sys"].get("sunset"),
-                "timezone_offset": data.get("timezone", 0),
+                "description": wb.get("description", "").capitalize(),
+                "main_condition": wb.get("main", ""),
                 "observed_at": datetime.now(TZ).strftime("%Y-%m-%d %H:%M"),
             }
         except (KeyError, IndexError, TypeError) as e:
-            logger.error("Ob-havo javobini parslashda xatolik: %s", e)
+            logger.error("Ob-havo parslash xatoligi: %s", e)
             return None
 
     @staticmethod
     def format_message(w: Dict[str, Any]) -> str:
         icon_map = {
-            "Clear": "☀️", "Clouds": "☁️", "Rain": "🌧",
-            "Drizzle": "🌦", "Thunderstorm": "⛈", "Snow": "❄️",
-            "Mist": "🌫", "Fog": "🌫", "Haze": "🌫",
+            "Clear": "☀️", "Clouds": "☁️", "Rain": "🌧", "Drizzle": "🌦",
+            "Thunderstorm": "⛈", "Snow": "❄️", "Mist": "🌫", "Fog": "🌫", "Haze": "🌫",
         }
         emoji = icon_map.get(w["main_condition"], "🌡")
         return (
             f"{emoji} <b>{w['city']}, {w['country']}</b>\n"
-            f"🕒 Hozirgi holat ({w['observed_at']})\n\n"
-            f"🌡 Harorat: <b>{w['temp']}°C</b> (sezilishi: {w['feels_like']}°C)\n"
+            f"🕒 <i>{w['observed_at']}</i>\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"🌡 Harorat: <b>{w['temp']}°C</b>  (sezilishi: {w['feels_like']}°C)\n"
             f"📉 Min/Maks: {w['temp_min']}°C / {w['temp_max']}°C\n"
             f"📝 Holat: {w['description']}\n"
             f"💧 Namlik: {w['humidity']}%\n"
@@ -342,16 +271,10 @@ weather_service = WeatherService(OWM_API_KEY)
 
 
 # =================================================================================
-# 5. XAVFSIZLIK OGOHLANTIRISH TIZIMI (SafetyAdvisor)
+# 5. XAVFSIZLIK OGOHLANTIRISHLARI
 # =================================================================================
 
 class SafetyAdvisor:
-    """
-    Ob-havo ko'rsatkichlariga asoslanib, foydalanuvchiga tegishli xavfsizlik
-    ogohlantirishlarini shakllantiradi. Har bir chegara qiymat (threshold)
-    O'zbekiston iqlim sharoitlarini hisobga olgan holda tanlangan.
-    """
-
     EXTREME_HEAT_C = 38
     HIGH_HEAT_C = 33
     EXTREME_COLD_C = -15
@@ -363,167 +286,114 @@ class SafetyAdvisor:
     @classmethod
     def analyze(cls, w: Dict[str, Any]) -> List[str]:
         warnings: List[str] = []
-        temp = w["temp"]
-        feels = w["feels_like"]
-        condition = w["main_condition"]
-        wind = w["wind_speed"]
-        visibility = w["visibility_m"]
-        humidity = w["humidity"]
+        temp, feels = w["temp"], w["feels_like"]
+        condition, wind = w["main_condition"], w["wind_speed"]
+        visibility, humidity = w["visibility_m"], w["humidity"]
 
-        # --- Haddan tashqari issiqlik ---
         if temp >= cls.EXTREME_HEAT_C or feels >= cls.EXTREME_HEAT_C:
             warnings.append(
                 "🔥 <b>OGOHLANTIRISH: Haddan tashqari issiqlik!</b>\n"
-                "Iloji boricha soyada yoki xonada bo'ling, kuniga kamida 2-3 litr suv iching, "
-                "kunning eng issiq vaqtida (12:00-17:00) ochiq quyoshda yurmang, "
-                "bosh kiyim va yengil kiyim taqing."
+                "Soyada/xonada bo'ling, kamida 2-3 litr suv iching, 12:00-17:00 orasida "
+                "ochiq quyoshda yurmang, bosh kiyim taqing."
             )
         elif temp >= cls.HIGH_HEAT_C or feels >= cls.HIGH_HEAT_C:
-            warnings.append(
-                "🌡 <b>Diqqat: Havo juda issiq.</b>\n"
-                "Ko'proq suv iching, quyoshdan himoyalaning, jismoniy faollikni cheklang."
-            )
+            warnings.append("🌡 <b>Diqqat:</b> havo juda issiq — ko'proq suv iching, faollikni cheklang.")
 
-        # --- Yuqori namlik + issiqlik (issiqlik indeksi xavfi) ---
         if temp >= cls.HIGH_HEAT_C and humidity >= 60:
-            warnings.append(
-                "💦 Yuqori namlik tufayli issiqlikni his qilish kuchayadi — "
-                "salqin joyda tez-tez dam oling."
-            )
+            warnings.append("💦 Yuqori namlik issiqlikni kuchaytiradi — tez-tez salqin joyda dam oling.")
 
-        # --- Haddan tashqari sovuq ---
         if temp <= cls.EXTREME_COLD_C or feels <= cls.EXTREME_COLD_C:
             warnings.append(
                 "🥶 <b>OGOHLANTIRISH: Qattiq sovuq!</b>\n"
-                "Terining ochiq qolishidan saqlaning (sovuq urishi xavfi bor), "
-                "issiq va bir necha qatlamli kiyim kiying, uzoq vaqt tashqarida qolmang, "
-                "muzlagan yo'llarda ehtiyot bo'ling."
+                "Terining ochiq qolishidan saqlaning, qatlamli issiq kiyim kiying, uzoq "
+                "tashqarida qolmang."
             )
         elif temp <= cls.COLD_C or feels <= cls.COLD_C:
-            warnings.append(
-                "❄️ <b>Diqqat: Havo sovuq.</b>\n"
-                "Issiqroq kiyinib chiqing, qo'lqop va sharf taqishni unutmang."
-            )
+            warnings.append("❄️ <b>Diqqat:</b> havo sovuq — issiqroq kiyining, qo'lqop/sharf taqing.")
 
-        # --- Yomg'ir / momaqaldiroq ---
         if condition == "Thunderstorm":
             warnings.append(
-                "⛈ <b>OGOHLANTIRISH: Momaqaldiroq!</b>\n"
-                "Ochiq maydonlarda, baland daraxtlar tagida va suv havzalari yaqinida "
-                "qolmang, elektr asboblardan ehtiyot bo'ling."
+                "⛈ <b>OGOHLANTIRISH: Momaqaldiroq!</b>\nOchiq maydon, baland daraxt va suv "
+                "havzalari yaqinida qolmang."
             )
         elif condition in ("Rain", "Drizzle"):
-            warnings.append(
-                "🌧 Yomg'ir yog'moqda — soyabon oling, yo'llar sirpanchiq bo'lishi mumkin, "
-                "haydash paytida ehtiyot bo'ling."
-            )
+            warnings.append("🌧 Yomg'ir yog'moqda — soyabon oling, yo'llar sirpanchiq bo'lishi mumkin.")
 
-        # --- Qor ---
         if condition == "Snow":
-            warnings.append(
-                "🌨 Qor yog'moqda — yo'llar muzlashi mumkin, mashinada zanjir/qishki shina "
-                "borligiga ishonch hosil qiling, piyoda yurganda ehtiyot bo'ling."
-            )
+            warnings.append("🌨 Qor yog'moqda — yo'llar muzlashi mumkin, ehtiyot bo'ling.")
 
-        # --- Kuchli shamol ---
         if wind >= cls.STRONG_WIND_MS:
-            warnings.append(
-                "💨 <b>OGOHLANTIRISH: Kuchli shamol!</b>\n"
-                "Baland inshootlar, reklama taxtalari va daraxtlar yaqinida ehtiyot bo'ling, "
-                "imkon qadar uyda qoling."
-            )
+            warnings.append("💨 <b>OGOHLANTIRISH: Kuchli shamol!</b>\nBaland inshoot va daraxtlardan uzoqroq yuring.")
         elif wind >= cls.MODERATE_WIND_MS:
-            warnings.append("🍃 O'rtacha shamol kutilmoqda — ochiq soyabonlardan ehtiyot bo'ling.")
+            warnings.append("🍃 O'rtacha shamol — ochiq soyabonlardan ehtiyot bo'ling.")
 
-        # --- Past ko'rinish (tuman) ---
         if visibility <= cls.LOW_VISIBILITY_M:
-            warnings.append(
-                "🌫 Ko'rinish darajasi past (tuman) — avtomobil chiroqlarini yoqing va "
-                "tezlikni kamaytiring."
-            )
+            warnings.append("🌫 Ko'rinish past (tuman) — chiroqlarni yoqing, tezlikni kamaytiring.")
 
         if not warnings:
-            warnings.append("✅ Hozircha maxsus xavfsizlik xavfi yo'q. Yaxshi kun tilaymiz!")
+            warnings.append("✅ Hozircha maxsus xavf yo'q. Ajoyib kun tilaymiz! 🌈")
 
         return warnings
 
 
 # =================================================================================
-# 6. KIYIM TAVSIYASI (ClothingAdvisor)
+# 6. KIYIM TAVSIYASI
 # =================================================================================
 
 class ClothingAdvisor:
-    """Ob-havo ko'rsatkichlariga mos kiyim tanlash bo'yicha tavsiyalar beradi."""
-
     @staticmethod
     def suggest(w: Dict[str, Any]) -> str:
-        temp = w["feels_like"]
-        condition = w["main_condition"]
-        wind = w["wind_speed"]
+        temp, condition, wind = w["feels_like"], w["main_condition"], w["wind_speed"]
 
         if temp >= 32:
-            base = "👕 Yengil, ochiq rangli va keng kiyimlar, shlyapa, quyoshdan ko'zoynak."
+            base = "👕 Yengil, ochiq rangli kiyim, 🧢 shlyapa, 🕶 quyoshdan ko'zoynak."
         elif temp >= 24:
-            base = "👚 Yengil futbolka/ko'ylak, shim yoki yubka, qulay poyabzal."
+            base = "👚 Yengil футболка/ko'ylak, qulay poyabzal."
         elif temp >= 16:
-            base = "🧥 Yengil куртка yoki kardigan, uzun yeng."
+            base = "🧥 Yengil куртка yoki kardigan."
         elif temp >= 8:
             base = "🧥 Issiqroq куртка, sviter, yopiq poyabzal."
         elif temp >= 0:
-            base = "🧣 Qishki palto, sharf, qalin sviter, issiq poyabzal."
+            base = "🧣 Qishki palto, sharf, qalin sviter."
         else:
-            base = "🥶 Puxovik, qalin qo'lqop, shapka, termokiyim va issiq etik."
+            base = "🥶 Puxovik, qalin qo'lqop, shapka, termokiyim."
 
         extra = []
         if condition in ("Rain", "Drizzle", "Thunderstorm"):
-            extra.append("☂️ soyabon yoki yomg'irpana")
+            extra.append("☂️ soyabon")
         if condition == "Snow":
             extra.append("👢 sirpanmaydigan qishki poyabzal")
         if wind >= 8:
-            extra.append("🧢 shamolga chidamli tashqi kiyim")
-
+            extra.append("🧢 shamolbardosh kiyim")
         if extra:
-            base += "\nQo'shimcha: " + ", ".join(extra) + "."
+            base += "\n➕ Qo'shimcha: " + ", ".join(extra) + "."
         return base
 
 
 # =================================================================================
-# 7. VALYUTA KURSLARI (CurrencyService)
+# 7. VALYUTA KURSLARI
 # =================================================================================
 
 class CurrencyService:
-    """
-    Bepul, kalitsiz ochiq API (open.er-api.com) orqali valyuta kurslarini oladi.
-    Baza sifatida USD ishlatiladi, so'ngra kerakli valyutalarga hisoblanadi.
-    """
-
     BASE_URL = "https://open.er-api.com/v6/latest/USD"
-    TARGET_CURRENCIES = ["UZS", "EUR", "RUB", "GBP", "KZT"]
+    TARGET = ["UZS", "EUR", "RUB", "GBP", "KZT"]
 
     async def get_rates(self) -> Optional[Dict[str, float]]:
         data = await fetch_json(self.BASE_URL)
         if not data or data.get("result") != "success":
             return None
         rates = data.get("rates", {})
-        return {cur: rates[cur] for cur in self.TARGET_CURRENCIES if cur in rates}
+        return {c: rates[c] for c in self.TARGET if c in rates}
 
     @staticmethod
     def format_message(rates: Dict[str, float]) -> str:
-        usd_to_uzs = rates.get("UZS")
-        lines = ["💱 <b>Valyuta kurslari (1 USD asosida)</b>\n"]
+        lines = ["💱 <b>Valyuta kurslari</b> (1 USD asosida)\n━━━━━━━━━━━━━━━"]
+        flags = {"UZS": "🇺🇿", "EUR": "🇪🇺", "RUB": "🇷🇺", "GBP": "🇬🇧", "KZT": "🇰🇿"}
         for cur, val in rates.items():
             if cur == "UZS":
-                lines.append(f"🇺🇸 1 USD = {val:,.0f} so'm")
+                lines.append(f"{flags[cur]} 1 USD = <b>{val:,.0f}</b> so'm")
             else:
-                lines.append(f"1 USD = {val:.3f} {cur}")
-        if usd_to_uzs:
-            eur_to_uzs = usd_to_uzs / rates["EUR"] if "EUR" in rates else None
-            rub_to_uzs = usd_to_uzs / rates["RUB"] if "RUB" in rates else None
-            lines.append("")
-            if eur_to_uzs:
-                lines.append(f"🇪🇺 1 EUR ≈ {eur_to_uzs:,.0f} so'm")
-            if rub_to_uzs:
-                lines.append(f"🇷🇺 1 RUB ≈ {rub_to_uzs:,.0f} so'm")
+                lines.append(f"{flags.get(cur,'')} 1 USD = {val:.3f} {cur}")
         return "\n".join(lines)
 
 
@@ -531,40 +401,29 @@ currency_service = CurrencyService()
 
 
 # =================================================================================
-# 8. HIKMATLI SO'ZLAR VA QIZIQARLI FAKTLAR (QuoteFactService)
+# 8. HIKMATLI SO'ZLAR / QIZIQARLI FAKTLAR
 # =================================================================================
 
 class QuoteFactService:
-    """
-    Tashqi API ishlamay qolgan taqdirda ham bot to'xtab qolmasligi uchun
-    lokal (zaxira) ro'yxatlar bilan ta'minlangan.
-    """
-
     QUOTE_API = "https://api.quotable.io/random"
     FACT_API = "https://uselessfacts.jsph.pl/api/v2/facts/random?language=en"
 
     FALLBACK_QUOTES = [
-        "Bilim — kuchdir.",
-        "Har bir muvaffaqiyat orqasida ko'plab urinishlar yotadi.",
-        "Bugun qilgan mehnating ertangi natijang.",
-        "Kichik qadamlar katta yo'lni bosib o'tadi.",
-        "Sabr — muvaffaqiyatning kalitidir.",
+        "Bilim — kuchdir. 💪", "Har bir muvaffaqiyat orqasida ko'plab urinish yotadi. 🌟",
+        "Bugungi mehnating ertangi natijang. 🌱", "Kichik qadamlar katta yo'lni bosib o'tadi. 👣",
+        "Sabr — muvaffaqiyat kaliti. 🔑",
     ]
-
     FALLBACK_FACTS = [
-        "Asal hech qachon buzilmaydi — arxeologlar minglab yillik asalni yeb ko'rishgan.",
-        "Sakkizoyoqning uchta yuragi bor.",
-        "Bir kun Yerda 24 soatdan biroz kamroq (23 soat 56 daqiqa) davom etadi.",
-        "Bananlar botanik jihatdan rezavorlar hisoblanadi.",
-        "Muz suvdan yengilroq, shuning uchun u suzadi.",
+        "Asal hech qachon buzilmaydi. 🍯", "Sakkizoyoqning uchta yuragi bor. 🐙",
+        "Bir kun 23 soat 56 daqiqa davom etadi. 🌍", "Banan botanik jihatdan rezavordir. 🍌",
+        "Muz suvdan yengilroq, shuning uchun suzadi. ❄️",
     ]
 
     async def get_quote(self) -> str:
         data = await fetch_json(self.QUOTE_API)
         if data and data.get("content"):
-            author = data.get("author", "Noma'lum")
-            return f'"{data["content"]}"\n— {author}'
-        return random.choice(self.FALLBACK_QUOTES)
+            return f'💬 "{data["content"]}"\n— {data.get("author","Noma\'lum")}'
+        return f"💬 {random.choice(self.FALLBACK_QUOTES)}"
 
     async def get_fact(self) -> str:
         data = await fetch_json(self.FACT_API)
@@ -577,30 +436,26 @@ quote_fact_service = QuoteFactService()
 
 
 # =================================================================================
-# 9. TARJIMON (TranslatorService)
+# 9. TARJIMON
 # =================================================================================
 
 class TranslatorService:
-    """deep-translator kutubxonasi orqali (Google Translate backend) matn tarjima qiladi."""
-
     @staticmethod
     async def translate(text: str, target_lang: str) -> str:
         if GoogleTranslator is None:
-            return "⚠️ Tarjimon kutubxonasi o'rnatilmagan (deep-translator)."
+            return "⚠️ Tarjimon kutubxonasi o'rnatilmagan."
         loop = asyncio.get_running_loop()
         try:
-            func = functools.partial(
-                GoogleTranslator(source="auto", target=target_lang).translate, text
-            )
+            func = functools.partial(GoogleTranslator(source="auto", target=target_lang).translate, text)
             result = await loop.run_in_executor(None, func)
             return result or "⚠️ Tarjima qilib bo'lmadi."
-        except Exception as e:  # tarjimon kutubxonasi turli xil xatolik chiqarishi mumkin
+        except Exception as e:
             logger.warning("Tarjima xatoligi: %s", e)
-            return f"⚠️ Tarjima qilishda xatolik yuz berdi. Til kodini tekshiring (masalan: en, ru, uz)."
+            return "⚠️ Tarjima xatosi. Til kodini tekshiring (masalan: en, ru, uz)."
 
 
 # =================================================================================
-# 10. ESLATMALAR VA TO-DO RO'YXATI (TodoManager)
+# 10. TODO / ESLATMALAR
 # =================================================================================
 
 class TodoManager:
@@ -614,16 +469,12 @@ class TodoManager:
     @staticmethod
     async def list_tasks(chat_id: int) -> List[Dict[str, Any]]:
         return await db_execute(
-            "SELECT * FROM todos WHERE chat_id = ? ORDER BY is_done ASC, id DESC",
-            (chat_id,),
-            fetch=True,
+            "SELECT * FROM todos WHERE chat_id = ? ORDER BY is_done ASC, id DESC", (chat_id,), fetch=True
         )
 
     @staticmethod
     async def mark_done(chat_id: int, task_id: int) -> None:
-        await db_execute(
-            "UPDATE todos SET is_done = 1 WHERE chat_id = ? AND id = ?", (chat_id, task_id)
-        )
+        await db_execute("UPDATE todos SET is_done = 1 WHERE chat_id = ? AND id = ?", (chat_id, task_id))
 
     @staticmethod
     async def delete_task(chat_id: int, task_id: int) -> None:
@@ -632,53 +483,41 @@ class TodoManager:
     @staticmethod
     def format_list(tasks: List[Dict[str, Any]]) -> str:
         if not tasks:
-            return "📝 Sizda hozircha vazifalar yo'q. Qo'shish uchun: /todo_add <matn>"
-        lines = ["📝 <b>Sizning vazifalaringiz:</b>\n"]
+            return "📝 Vazifalar yo'q. Qo'shish: <code>/todo_add matn</code>"
+        lines = ["📝 <b>Vazifalaringiz:</b>\n━━━━━━━━━━━━━━━"]
         for t in tasks:
             mark = "✅" if t["is_done"] else "🔲"
             lines.append(f"{mark} <code>#{t['id']}</code> {t['task']}")
-        lines.append("\nBajarish: /todo_done <id>  |  O'chirish: /todo_del <id>")
+        lines.append("\n✔️ Bajarish: /todo_done id   🗑 O'chirish: /todo_del id")
         return "\n".join(lines)
 
 
 # =================================================================================
-# 11. YANGILIKLAR LENTASI (NewsService)
+# 11. YANGILIKLAR
 # =================================================================================
 
 class NewsService:
-    """
-    NewsAPI.org orqali ishlaydi. Bepul API kalit talab qiladi (.env -> NEWSAPI_KEY).
-    Kalit bo'lmasa, foydalanuvchiga aniq xabar ko'rsatiladi (xatolik emas).
-    """
-
     BASE_URL = "https://newsapi.org/v2/everything"
 
     async def get_news(self, query: str = "Uzbekistan", limit: int = 5) -> Optional[List[Dict[str, str]]]:
         if not NEWSAPI_KEY:
             return None
-        params = {
-            "q": query,
-            "language": "ru",  # O'zbekiston bo'yicha ko'proq rus tilidagi manbalar mavjud
-            "sortBy": "publishedAt",
-            "pageSize": limit,
-            "apiKey": NEWSAPI_KEY,
-        }
+        params = {"q": query, "language": "ru", "sortBy": "publishedAt", "pageSize": limit, "apiKey": NEWSAPI_KEY}
         data = await fetch_json(self.BASE_URL, params=params)
         if not data or data.get("status") != "ok":
             return None
-        articles = data.get("articles", [])[:limit]
         return [
             {"title": a.get("title", ""), "url": a.get("url", ""), "source": a.get("source", {}).get("name", "")}
-            for a in articles
+            for a in data.get("articles", [])[:limit]
         ]
 
     @staticmethod
     def format_message(articles: List[Dict[str, str]]) -> str:
         if not articles:
-            return "📰 Hozircha yangiliklar topilmadi."
-        lines = ["📰 <b>So'nggi yangiliklar:</b>\n"]
-        for i, a in enumerate(articles, start=1):
-            lines.append(f"{i}. <a href='{a['url']}'>{a['title']}</a> ({a['source']})")
+            return "📰 Hozircha yangilik topilmadi."
+        lines = ["📰 <b>So'nggi yangiliklar</b>\n━━━━━━━━━━━━━━━"]
+        for i, a in enumerate(articles, 1):
+            lines.append(f"{i}. <a href='{a['url']}'>{a['title']}</a>  <i>({a['source']})</i>")
         return "\n".join(lines)
 
 
@@ -686,7 +525,7 @@ news_service = NewsService()
 
 
 # =================================================================================
-# 12. KINO SHARHLARI (MovieService — OMDb API)
+# 12. KINO (OMDb)
 # =================================================================================
 
 class MovieService:
@@ -695,8 +534,7 @@ class MovieService:
     async def search(self, title: str) -> Optional[Dict[str, Any]]:
         if not OMDB_API_KEY:
             return None
-        params = {"t": title, "apikey": OMDB_API_KEY}
-        data = await fetch_json(self.BASE_URL, params=params)
+        data = await fetch_json(self.BASE_URL, params={"t": title, "apikey": OMDB_API_KEY})
         if not data or data.get("Response") != "True":
             return None
         return data
@@ -704,11 +542,9 @@ class MovieService:
     @staticmethod
     def format_message(m: Dict[str, Any]) -> str:
         return (
-            f"🎬 <b>{m.get('Title')}</b> ({m.get('Year')})\n"
-            f"⭐ IMDB reytingi: {m.get('imdbRating', 'N/A')}\n"
-            f"🎭 Janr: {m.get('Genre', 'N/A')}\n"
-            f"🎥 Rejissyor: {m.get('Director', 'N/A')}\n"
-            f"📝 Syujet: {m.get('Plot', 'Mavjud emas')}"
+            f"🎬 <b>{m.get('Title')}</b> ({m.get('Year')})\n━━━━━━━━━━━━━━━\n"
+            f"⭐ IMDB: {m.get('imdbRating','N/A')}\n🎭 Janr: {m.get('Genre','N/A')}\n"
+            f"🎥 Rejissyor: {m.get('Director','N/A')}\n📝 {m.get('Plot','Mavjud emas')}"
         )
 
 
@@ -716,7 +552,7 @@ movie_service = MovieService()
 
 
 # =================================================================================
-# 13. KITOB VA AUDIOKITOB TAVSIYALARI (BookService — Google Books API)
+# 13. KITOBLAR (Google Books)
 # =================================================================================
 
 class BookService:
@@ -729,23 +565,23 @@ class BookService:
         data = await fetch_json(self.BASE_URL, params=params)
         if not data or "items" not in data:
             return None
-        results = []
+        out = []
         for item in data["items"][:limit]:
             info = item.get("volumeInfo", {})
-            results.append(
+            out.append(
                 {
                     "title": info.get("title", "Noma'lum"),
                     "authors": ", ".join(info.get("authors", ["Noma'lum muallif"])),
                     "rating": info.get("averageRating", "—"),
                 }
             )
-        return results
+        return out
 
     @staticmethod
     def format_message(books: List[Dict[str, str]], genre: str) -> str:
         if not books:
-            return f"📚 '{genre}' janri bo'yicha kitoblar topilmadi."
-        lines = [f"📚 <b>'{genre}' janridagi tavsiyalar:</b>\n"]
+            return f"📚 '{genre}' bo'yicha kitob topilmadi."
+        lines = [f"📚 <b>'{genre}' janridagi tavsiyalar</b>\n━━━━━━━━━━━━━━━"]
         for b in books:
             lines.append(f"• <b>{b['title']}</b> — {b['authors']} (⭐ {b['rating']})")
         return "\n".join(lines)
@@ -755,21 +591,11 @@ book_service = BookService()
 
 
 # =================================================================================
-# 14. SPORT NATIJALARI (SportsService — TheSportsDB)
+# 14. SPORT (TheSportsDB)
 # =================================================================================
 
 class SportsService:
-    """
-    TheSportsDB bepul (test) API kaliti bilan ishlaydi. Muayyan liganing so'nggi
-    o'tkazilgan o'yinlari natijalarini qaytaradi.
-    """
-
-    LEAGUE_IDS = {
-        "epl": "4328",       # Angliya Premer-ligasi
-        "laliga": "4335",    # Ispaniya La Liga
-        "uefa": "4480",      # UEFA Champions League
-        "seriea": "4332",    # Italiya Serie A
-    }
+    LEAGUE_IDS = {"epl": "4328", "laliga": "4335", "uefa": "4480", "seriea": "4332"}
 
     def __init__(self, api_key: str):
         self.api_key = api_key
@@ -782,25 +608,22 @@ class SportsService:
         data = await fetch_json(url, params={"id": league_id})
         if not data or not data.get("events"):
             return None
-        events = data["events"][:5]
         return [
             {
-                "home": e.get("strHomeTeam", ""),
-                "away": e.get("strAwayTeam", ""),
-                "home_score": e.get("intHomeScore") or "-",
-                "away_score": e.get("intAwayScore") or "-",
+                "home": e.get("strHomeTeam", ""), "away": e.get("strAwayTeam", ""),
+                "home_score": e.get("intHomeScore") or "-", "away_score": e.get("intAwayScore") or "-",
                 "date": e.get("dateEvent", ""),
             }
-            for e in events
+            for e in data["events"][:5]
         ]
 
     @staticmethod
     def format_message(results: List[Dict[str, str]], league: str) -> str:
         if not results:
-            return f"⚽ '{league}' bo'yicha natijalar topilmadi."
-        lines = [f"⚽ <b>So'nggi natijalar ({league.upper()}):</b>\n"]
+            return f"⚽ '{league}' bo'yicha natija topilmadi."
+        lines = [f"⚽ <b>So'nggi natijalar ({league.upper()})</b>\n━━━━━━━━━━━━━━━"]
         for r in results:
-            lines.append(f"{r['date']}: {r['home']} {r['home_score']} - {r['away_score']} {r['away']}")
+            lines.append(f"{r['date']}: {r['home']} <b>{r['home_score']}-{r['away_score']}</b> {r['away']}")
         return "\n".join(lines)
 
 
@@ -808,21 +631,13 @@ sports_service = SportsService(THESPORTSDB_API_KEY)
 
 
 # =================================================================================
-# 15. YAQIN ATROFDAGI DORIXONA / DO'KON (PlaceFinderService — OpenStreetMap Overpass)
+# 15. YAQIN ATROFDAGI DORIXONA / DO'KON (OpenStreetMap Overpass)
 # =================================================================================
 
 class PlaceFinderService:
-    """
-    OpenStreetMap Overpass API orqali ishlaydi — kalit talab qilinmaydi.
-    Foydalanuvchi geolokatsiyasi asosida yaqin atrofdagi dorixona/do'konlarni topadi.
-    """
-
     OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
-    async def find_nearby(
-        self, lat: float, lon: float, place_type: str = "pharmacy", radius_m: int = 1500
-    ) -> Optional[List[Dict[str, Any]]]:
-        # place_type: "pharmacy" (dorixona) yoki "supermarket" (do'kon)
+    async def find_nearby(self, lat: float, lon: float, place_type: str = "pharmacy", radius_m: int = 1500):
         amenity_filter = (
             f'node["amenity"="pharmacy"](around:{radius_m},{lat},{lon});'
             if place_type == "pharmacy"
@@ -836,31 +651,23 @@ class PlaceFinderService:
             response.raise_for_status()
             data = response.json()
         except Exception as e:
-            logger.warning("Overpass API xatoligi: %s", e)
+            logger.warning("Overpass xatoligi: %s", e)
             return None
-
         elements = data.get("elements", [])[:10]
-        results = []
-        for el in elements:
-            tags = el.get("tags", {})
-            results.append(
-                {
-                    "name": tags.get("name", "Nomsiz"),
-                    "lat": el.get("lat"),
-                    "lon": el.get("lon"),
-                }
-            )
-        return results
+        return [
+            {"name": el.get("tags", {}).get("name", "Nomsiz"), "lat": el.get("lat"), "lon": el.get("lon")}
+            for el in elements
+        ]
 
     @staticmethod
-    def format_message(places: List[Dict[str, Any]], place_type: str) -> str:
+    def format_message(places, place_type: str) -> str:
         label = "dorixona" if place_type == "pharmacy" else "supermarket"
         if not places:
             return f"🔍 Yaqin atrofda {label} topilmadi."
-        lines = [f"📍 <b>Yaqin atrofdagi {label}lar:</b>\n"]
+        lines = [f"📍 <b>Yaqin atrofdagi {label}lar</b>\n━━━━━━━━━━━━━━━"]
         for p in places:
-            maps_link = f"https://www.google.com/maps?q={p['lat']},{p['lon']}"
-            lines.append(f"• <a href='{maps_link}'>{p['name']}</a>")
+            link = f"https://www.google.com/maps?q={p['lat']},{p['lon']}"
+            lines.append(f"• <a href='{link}'>{p['name']}</a>")
         return "\n".join(lines)
 
 
@@ -868,25 +675,19 @@ place_finder_service = PlaceFinderService()
 
 
 # =================================================================================
-# 16. SAYOHAT YO'NALISHLARI (TravelService — statik/kuratsiya qilingan ma'lumot)
+# 16. SAYOHAT YO'NALISHLARI
 # =================================================================================
 
 class TravelService:
-    """
-    Tashqi to'lov talab qiluvchi sayohat API'lariga bog'lanmaslik uchun,
-    mashhur yo'nalishlar haqida qisqa, kuratsiya qilingan ma'lumotlar bazasi.
-    Kelajakda istalgan Travel API (masalan, Amadeus) bilan almashtirish mumkin.
-    """
-
     DESTINATIONS = [
-        {"name": "Samarqand, O'zbekiston", "desc": "Registon maydoni va Amir Temur davri me'morchiligi bilan mashhur."},
-        {"name": "Buxoro, O'zbekiston", "desc": "2000 yildan ortiq tarixga ega, Ark qal'asi va Poi-Kalon majmuasi."},
-        {"name": "Xiva, O'zbekiston", "desc": "Ichan-Qal'a — YuNESKO ro'yxatidagi ochiq osmon muzeyi."},
-        {"name": "Istanbul, Turkiya", "desc": "Ikki qit'ani bog'laydigan shahar, Ayasofya va Ko'k masjid."},
-        {"name": "Dubay, BAA", "desc": "Zamonaviy me'morchilik, Burj Khalifa va cho'l safarlari."},
-        {"name": "Parij, Fransiya", "desc": "Eyfel minorasi, Luvr muzeyi va romantik atmosfera."},
-        {"name": "Bali, Indoneziya", "desc": "Tropik plyajlar, guruch teraslari va sörf sporti."},
-        {"name": "Rim, Italiya", "desc": "Kolizey, Vatikan va boy antik tarix."},
+        {"name": "🇺🇿 Samarqand", "desc": "Registon maydoni va Amir Temur davri me'morchiligi."},
+        {"name": "🇺🇿 Buxoro", "desc": "2000+ yillik tarix, Ark qal'asi, Poi-Kalon majmuasi."},
+        {"name": "🇺🇿 Xiva", "desc": "Ichan-Qal'a — YuNESKO ro'yxatidagi ochiq osmon muzeyi."},
+        {"name": "🇹🇷 Istanbul", "desc": "Ikki qit'ani bog'laydigan shahar, Ayasofya."},
+        {"name": "🇦🇪 Dubay", "desc": "Zamonaviy me'morchilik, Burj Khalifa, cho'l safari."},
+        {"name": "🇫🇷 Parij", "desc": "Eyfel minorasi, Luvr muzeyi, romantik muhit."},
+        {"name": "🇮🇩 Bali", "desc": "Tropik plyajlar, guruch teraslari, sörf."},
+        {"name": "🇮🇹 Rim", "desc": "Kolizey, Vatikan, boy antik tarix."},
     ]
 
     @classmethod
@@ -895,9 +696,9 @@ class TravelService:
 
     @staticmethod
     def format_message(destinations: List[Dict[str, str]]) -> str:
-        lines = ["✈️ <b>Sayohat uchun tavsiyalar:</b>\n"]
+        lines = ["✈️ <b>Sayohat tavsiyalari</b>\n━━━━━━━━━━━━━━━"]
         for d in destinations:
-            lines.append(f"📍 <b>{d['name']}</b>\n{d['desc']}\n")
+            lines.append(f"\n📍 <b>{d['name']}</b>\n{d['desc']}")
         return "\n".join(lines)
 
 
@@ -905,22 +706,15 @@ travel_service = TravelService()
 
 
 # =================================================================================
-# 17. YO'L TIRBANDLIGI (TrafficService) — HOZIRCHA "STUB" (bo'sh joy) IMPLEMENTATSIYA
+# 17. YO'L TIRBANDLIGI — STUB (kelajakda TomTom/Yandex API bilan almashtiriladi)
 # =================================================================================
-#
-# Yo'l tirbandligi ma'lumotlari uchun odatda pullik API'lar kerak bo'ladi
-# (Google Maps Roads API, Yandex Maps API yoki TomTom Traffic API).
-# Hozircha bu funksiya foydalanuvchiga tushunarli xabar qaytaradi va
-# kelajakda haqiqiy API bilan osongina almashtirilishi mumkin bo'lgan
-# aniq interfeys (interface) sifatida qoldirilgan.
-#
+
 class TrafficService:
     async def get_traffic_info(self, city: str) -> str:
-        # TODO: Bu yerga TomTom / Yandex / Google Maps Traffic API integratsiyasini qo'shish kerak.
-        # Masalan: https://api.tomtom.com/traffic/services/4/flowSegmentData/...
+        # TODO: TomTom/Yandex/Google Traffic API integratsiyasi shu yerga qo'shiladi
         return (
-            f"🚗 '{city}' shahri uchun tirbandlik ma'lumoti hozircha mavjud emas.\n"
-            "Bu funksiya tez orada (TomTom/Yandex Maps API integratsiyasi orqali) qo'shiladi."
+            f"🚗 '{city}' uchun tirbandlik ma'lumoti hozircha mavjud emas.\n"
+            "Bu funksiya tez orada qo'shiladi. 🔧"
         )
 
 
@@ -928,132 +722,115 @@ traffic_service = TrafficService()
 
 
 # =================================================================================
+# NAMOZ VAQTLARI — FAQAT REJA (hozircha ishga tushirilmagan) — PRAYER_TIMES_TODO
 # =================================================================================
-# NAMOZ VAQTLARI INTEGRATSIYASI — HOZIRCHA FAQAT REJA/KOMMENTARIYA SIFATIDA
-# =================================================================================
-# =================================================================================
-#
-# PRAYER_TIMES_TODO:
-# Kelajakda Aladhan API (https://aladhan.com/prayer-times-api) orqali quyidagicha
-# integratsiya qilinishi rejalashtirilgan:
 #
 # class PrayerTimesService:
 #     BASE_URL = "https://api.aladhan.com/v1/timingsByCity"
 #
 #     async def get_timings(self, city: str, country: str = "Uzbekistan", method: int = 2):
-#         params = {"city": city, "country": country, "method": method}
-#         data = await fetch_json(self.BASE_URL, params=params)
+#         data = await fetch_json(self.BASE_URL, params={"city": city, "country": country, "method": method})
 #         if not data or data.get("code") != 200:
 #             return None
-#         timings = data["data"]["timings"]
+#         t = data["data"]["timings"]
 #         return {
-#             "Bomdod": timings.get("Fajr"),
-#             "Quyosh": timings.get("Sunrise"),
-#             "Peshin": timings.get("Dhuhr"),
-#             "Asr": timings.get("Asr"),
-#             "Shom": timings.get("Maghrib"),
-#             "Xufton": timings.get("Isha"),
+#             "🌅 Bomdod": t.get("Fajr"), "☀️ Quyosh": t.get("Sunrise"), "🕌 Peshin": t.get("Dhuhr"),
+#             "🌇 Asr": t.get("Asr"), "🌆 Shom": t.get("Maghrib"), "🌙 Xufton": t.get("Isha"),
 #         }
 #
-# Handler qo'shilganda /namoz yoki /prayertimes komandasi orqali chaqiriladi va
-# foydalanuvchining saqlangan shahri asosida vaqtlar ko'rsatiladi.
-# HOZIRCHA BU FUNKSIYA ISHGA TUSHIRILMAGAN — faqat reja sifatida saqlanmoqda.
+# Handler qo'shilganda /namoz komandasi bilan chaqiriladi. HOZIRCHA FAOLLASHTIRILMAGAN.
 #
 # =================================================================================
 
 
 # =================================================================================
-# 18. TELEGRAM UI — TUGMALAR (KEYBOARDS)
+# 18. INLINE MENYU (rangli/emojili tugmalar)
 # =================================================================================
 
-MAIN_MENU_BUTTONS = [
-    [KeyboardButton("🌤 Ob-havo"), KeyboardButton("📍 Joylashuvni yuborish", request_location=True)],
-    [KeyboardButton("👕 Kiyim maslahati"), KeyboardButton("💱 Valyuta")],
-    [KeyboardButton("📰 Yangiliklar"), KeyboardButton("🎬 Kino")],
-    [KeyboardButton("📚 Kitoblar"), KeyboardButton("⚽ Sport")],
-    [KeyboardButton("🏥 Yaqin dorixona"), KeyboardButton("🛒 Yaqin do'kon")],
-    [KeyboardButton("✈️ Sayohat"), KeyboardButton("💡 Fakt/Iqtibos")],
-    [KeyboardButton("📝 Vazifalarim"), KeyboardButton("💬 Tarjimon")],
-    [KeyboardButton("⚙️ Sozlamalar")],
-]
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton("🌤 Ob-havo", callback_data="menu:weather"),
+         InlineKeyboardButton("👕 Kiyim maslahati", callback_data="menu:clothing")],
+        [InlineKeyboardButton("💱 Valyuta", callback_data="menu:currency"),
+         InlineKeyboardButton("📰 Yangiliklar", callback_data="menu:news")],
+        [InlineKeyboardButton("🎬 Kino", callback_data="menu:movie"),
+         InlineKeyboardButton("📚 Kitoblar", callback_data="menu:book")],
+        [InlineKeyboardButton("⚽️ Sport", callback_data="menu:sport"),
+         InlineKeyboardButton("✈️ Sayohat", callback_data="menu:travel")],
+        [InlineKeyboardButton("🏥 Dorixona", callback_data="menu:pharmacy"),
+         InlineKeyboardButton("🛒 Do'kon", callback_data="menu:shop")],
+        [InlineKeyboardButton("💡 Fakt/Iqtibos", callback_data="menu:quote"),
+         InlineKeyboardButton("💬 Tarjimon", callback_data="menu:translate")],
+        [InlineKeyboardButton("📝 Vazifalarim", callback_data="menu:todo"),
+         InlineKeyboardButton("🔔 Obuna", callback_data="menu:subscribe")],
+        [InlineKeyboardButton("ℹ️ Yordam", callback_data="menu:help")],
+    ]
+    return InlineKeyboardMarkup(buttons)
 
 
-def main_menu_markup() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(MAIN_MENU_BUTTONS, resize_keyboard=True)
+def back_button() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Orqaga", callback_data="menu:back")]])
+
+
+def location_request_keyboard() -> ReplyKeyboardMarkup:
+    """Faqat joylashuv so'rash uchun (Telegram inline tugma orqali lokatsiya so'ray olmaydi)."""
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("📍 Joylashuvni yuborish", request_location=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
 
 
 # =================================================================================
 # 19. TELEGRAM HANDLERLAR
 # =================================================================================
 
-# ---- /start va asosiy menyu ----
+WELCOME_TEXT = (
+    "✨ <b>Assalomu alaykum!</b> ✨\n\n"
+    "🤖 Men — <b>Premium Ob-havo Bot</b> 🌈\n"
+    "🌤 Real vaqtdagi ob-havo, ⚠️ xavfsizlik ogohlantirishlari, 👕 kiyim maslahati, "
+    "💱 valyuta kurslari, 📰 yangiliklar, 🎬 kino, 📚 kitob tavsiyalari va yana ko'p narsa!\n\n"
+    "👇 Quyidagi menyudan tanlang yoki shahar nomini yozing (masalan: <i>Toshkent</i>)."
+)
+
+HELP_TEXT = (
+    "📖 <b>Barcha komandalar</b>\n━━━━━━━━━━━━━━━\n"
+    "🌤 /weather &lt;shahar&gt;\n🏙 /setcity &lt;shahar&gt;\n💱 /currency\n📰 /news\n"
+    "🎬 /movie &lt;nomi&gt;\n📚 /book &lt;janr&gt;\n⚽️ /sport &lt;epl|laliga|uefa|seriea&gt;\n"
+    "✈️ /travel\n💡 /quote  🧠 /fact\n💬 /translate &lt;til&gt; &lt;matn&gt;\n"
+    "📝 /todo_add /todo_list /todo_done /todo_del\n"
+    f"🔔 /subscribe (kunlik {DAILY_BROADCAST_HOUR:02d}:{DAILY_BROADCAST_MINUTE:02d}) /unsubscribe\n"
+    "📍 Joylashuv yuborsangiz — shu joy ob-havosi va yaqin dorixona/do'konlarni topaman."
+)
+
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     username = update.effective_user.username if update.effective_user else None
     await upsert_user(chat_id, username)
-    text = (
-        "👋 Assalomu alaykum! Men <b>Ko'p funksiyali Ob-havo Boti</b>man.\n\n"
-        "🌤 Hozirgi ob-havo, xavfsizlik ogohlantirishlari, kiyim maslahatlari, "
-        "valyuta kurslari, yangiliklar, kino/kitob tavsiyalari va boshqa ko'plab "
-        "funksiyalarni taqdim etaman.\n\n"
-        "Boshlash uchun quyidagi menyudan foydalaning yoki shahringiz nomini yozing "
-        "(masalan: <i>Toshkent</i>) yoki 📍 joylashuvingizni yuboring.\n\n"
-        "Barcha komandalar uchun: /help"
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=main_menu_markup())
+    await update.message.reply_text(WELCOME_TEXT, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
-        "📖 <b>Mavjud komandalar:</b>\n\n"
-        "/weather &lt;shahar&gt; — hozirgi ob-havo\n"
-        "/setcity &lt;shahar&gt; — standart shaharni saqlash\n"
-        "/currency — valyuta kurslari\n"
-        "/news — so'nggi yangiliklar\n"
-        "/movie &lt;nomi&gt; — kino haqida ma'lumot\n"
-        "/book &lt;janr&gt; — kitob tavsiyalari\n"
-        "/sport &lt;epl|laliga|uefa|seriea&gt; — sport natijalari\n"
-        "/travel — sayohat yo'nalishlari\n"
-        "/quote — hikmatli so'z\n"
-        "/fact — qiziqarli fakt\n"
-        "/translate &lt;til&gt; &lt;matn&gt; — tarjima (masalan: /translate en Salom)\n"
-        "/todo_add &lt;matn&gt; — vazifa qo'shish\n"
-        "/todo_list — vazifalar ro'yxati\n"
-        "/todo_done &lt;id&gt; — vazifani bajarilgan deb belgilash\n"
-        "/todo_del &lt;id&gt; — vazifani o'chirish\n"
-        "/subscribe — kunlik xabarlarga obuna bo'lish (ertalab soat "
-        f"{DAILY_BROADCAST_HOUR:02d}:{DAILY_BROADCAST_MINUTE:02d})\n"
-        "/unsubscribe — obunani bekor qilish\n"
-        "📍 Joylashuv yuborsangiz — shu joy bo'yicha ob-havo va yaqin atrofdagi "
-        "dorixona/do'konlarni topaman."
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML, reply_markup=back_button())
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Botda kutilmagan xatolik yuz berdi", exc_info=context.error)
+    logger.error("💥 Botda kutilmagan xatolik:", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         try:
-            await update.effective_message.reply_text(
-                "⚠️ Kechirasiz, xatolik yuz berdi. Birozdan so'ng qayta urinib ko'ring."
-            )
+            await update.effective_message.reply_text("⚠️ Kechirasiz, xatolik yuz berdi. Birozdan so'ng qayta urinib ko'ring.")
         except TelegramError:
             pass
 
 
 # ---- Ob-havo ----
 
-async def _send_weather_report(update: Update, weather: Dict[str, Any]) -> None:
-    await update.message.reply_text(
-        WeatherService.format_message(weather), parse_mode=ParseMode.HTML
-    )
+async def _send_weather_report(chat, weather: Dict[str, Any]) -> None:
+    await chat.send_message(WeatherService.format_message(weather), parse_mode=ParseMode.HTML)
     warnings = SafetyAdvisor.analyze(weather)
-    await update.message.reply_text(
-        "\n\n".join(warnings), parse_mode=ParseMode.HTML
-    )
-    clothing = ClothingAdvisor.suggest(weather)
-    await update.message.reply_text(f"👕 <b>Kiyim maslahati:</b>\n{clothing}", parse_mode=ParseMode.HTML)
+    await chat.send_message("\n\n".join(warnings), parse_mode=ParseMode.HTML)
+    await chat.send_message(f"👕 <b>Kiyim maslahati:</b>\n{ClothingAdvisor.suggest(weather)}", parse_mode=ParseMode.HTML)
 
 
 async def cmd_weather(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1067,39 +844,38 @@ async def cmd_weather(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         elif user and user.get("lat") and user.get("lon"):
             weather = await weather_service.get_by_coords(user["lat"], user["lon"])
             if weather:
-                await _send_weather_report(update, weather)
+                await _send_weather_report(update.effective_chat, weather)
             else:
-                await update.message.reply_text("⚠️ Ob-havo ma'lumotini olishda xatolik yuz berdi.")
+                await update.effective_message.reply_text("⚠️ Ob-havo ma'lumotini olib bo'lmadi.")
             return
         else:
-            await update.message.reply_text(
-                "Iltimos, shahar nomini kiriting: /weather Toshkent\n"
-                "yoki 📍 joylashuvingizni yuboring."
+            await update.effective_message.reply_text(
+                "🏙 Shahar nomini kiriting: <code>/weather Toshkent</code>\n"
+                "yoki 📍 joylashuvingizni yuboring:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=location_request_keyboard(),
             )
             return
 
     weather = await weather_service.get_by_city(city)
     if not weather:
-        await update.message.reply_text(
-            f"⚠️ '{city}' uchun ob-havo ma'lumoti topilmadi. Shahar nomini tekshirib qayta urinib ko'ring."
-        )
+        await update.effective_message.reply_text(f"⚠️ '{city}' uchun ob-havo topilmadi. Nomni tekshiring.")
         return
-    await _send_weather_report(update, weather)
+    await _send_weather_report(update.effective_chat, weather)
 
 
 async def cmd_setcity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     if not context.args:
-        await update.message.reply_text("Foydalanish: /setcity Toshkent")
+        await update.message.reply_text("Foydalanish: <code>/setcity Toshkent</code>", parse_mode=ParseMode.HTML)
         return
     city = " ".join(context.args)
-    # avval haqiqatan ham mavjudligini tekshiramiz
     weather = await weather_service.get_by_city(city)
     if not weather:
-        await update.message.reply_text(f"⚠️ '{city}' shahri topilmadi. Nomni tekshiring.")
+        await update.message.reply_text(f"⚠️ '{city}' shahri topilmadi.")
         return
     await set_user_city(chat_id, weather["city"])
-    await update.message.reply_text(f"✅ Standart shahringiz '{weather['city']}' etib saqlandi.")
+    await update.message.reply_text(f"✅ Standart shahringiz: <b>{weather['city']}</b>", parse_mode=ParseMode.HTML)
 
 
 async def on_location_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1110,88 +886,43 @@ async def on_location_received(update: Update, context: ContextTypes.DEFAULT_TYP
     if not weather:
         await update.message.reply_text("⚠️ Joylashuvingiz bo'yicha ob-havo topilmadi.")
         return
-    await _send_weather_report(update, weather)
-    context.user_data["last_location"] = (loc.latitude, loc.longitude)
+    await _send_weather_report(update.effective_chat, weather)
+    pending = context.user_data.pop("pending_location_action", None)
+    if pending == "pharmacy":
+        await _handle_nearby(update, context, "pharmacy")
+    elif pending == "shop":
+        await _handle_nearby(update, context, "supermarket")
 
 
-async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Asosiy menyudagi tugmalar bosilganda yoki oddiy matn (shahar nomi) yuborilganda ishlaydi."""
-    text = update.message.text.strip()
-    chat_id = update.effective_chat.id
-
-    menu_actions = {
-        "🌤 Ob-havo": cmd_weather,
-        "👕 Kiyim maslahati": cmd_weather,  # shahar bo'lsa avtomatik kiyim maslahati ham chiqadi
-        "💱 Valyuta": cmd_currency,
-        "📰 Yangiliklar": cmd_news,
-        "🎬 Kino": None,
-        "📚 Kitoblar": None,
-        "⚽ Sport": None,
-        "🏥 Yaqin dorixona": None,
-        "🛒 Yaqin do'kon": None,
-        "✈️ Sayohat": cmd_travel,
-        "💡 Fakt/Iqtibos": cmd_quote,
-        "📝 Vazifalarim": cmd_todo_list,
-        "💬 Tarjimon": None,
-        "⚙️ Sozlamalar": cmd_help,
-    }
-
-    if text in menu_actions and menu_actions[text] is not None:
-        await menu_actions[text](update, context)
-        return
-
-    if text == "🎬 Kino":
-        await update.message.reply_text("Kino nomini shunday yuboring: /movie Inception")
-        return
-    if text == "📚 Kitoblar":
-        await update.message.reply_text("Janrni shunday yuboring: /book fantasy")
-        return
-    if text == "⚽ Sport":
-        await update.message.reply_text("Liga nomini tanlang: /sport epl | laliga | uefa | seriea")
-        return
-    if text == "🏥 Yaqin dorixona":
-        await cmd_nearby_pharmacy(update, context)
-        return
-    if text == "🛒 Yaqin do'kon":
-        await cmd_nearby_shop(update, context)
-        return
-    if text == "💬 Tarjimon":
-        await update.message.reply_text("Foydalanish: /translate en Salom, qandaysiz?")
-        return
-
-    # Agar boshqa hech narsaga mos kelmasa — shahar nomi deb hisoblab, ob-havo qaytaramiz
-    weather = await weather_service.get_by_city(text)
-    if weather:
-        await _send_weather_report(update, weather)
-    else:
-        await update.message.reply_text(
-            "🤔 Buni tushunmadim. Shahar nomi kiriting yoki /help orqali komandalar bilan tanishing."
-        )
-
-
-# ---- Valyuta ----
+# ---- Valyuta / fakt / sayohat / tarjimon ----
 
 async def cmd_currency(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     rates = await currency_service.get_rates()
+    target = update.effective_message
     if not rates:
-        await update.message.reply_text("⚠️ Valyuta kurslarini olishda xatolik yuz berdi.")
+        await target.reply_text("⚠️ Valyuta kurslarini olishda xatolik.")
         return
-    await update.message.reply_text(CurrencyService.format_message(rates), parse_mode=ParseMode.HTML)
+    await target.reply_text(CurrencyService.format_message(rates), parse_mode=ParseMode.HTML)
 
-
-# ---- Iqtibos / fakt ----
 
 async def cmd_quote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     quote = await quote_fact_service.get_quote()
     fact = await quote_fact_service.get_fact()
-    await update.message.reply_text(f"💡 <b>Kunning hikmati:</b>\n{quote}\n\n🧠 <b>Qiziqarli fakt:</b>\n{fact}", parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(
+        f"{quote}\n\n🧠 <b>Qiziqarli fakt:</b>\n{fact}", parse_mode=ParseMode.HTML
+    )
 
 
-# ---- Tarjimon ----
+async def cmd_travel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    destinations = TravelService.random_pick(3)
+    await update.effective_message.reply_text(TravelService.format_message(destinations), parse_mode=ParseMode.HTML)
+
 
 async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(context.args) < 2:
-        await update.message.reply_text("Foydalanish: /translate <til_kodi> <matn>\nMasalan: /translate en Salom dunyo")
+        await update.message.reply_text(
+            "Foydalanish: <code>/translate en Salom dunyo</code>", parse_mode=ParseMode.HTML
+        )
         return
     target_lang = context.args[0]
     text = " ".join(context.args[1:])
@@ -1199,11 +930,11 @@ async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(f"🌐 <b>Tarjima ({target_lang}):</b>\n{result}", parse_mode=ParseMode.HTML)
 
 
-# ---- To-do / vazifalar ----
+# ---- To-do ----
 
 async def cmd_todo_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Foydalanish: /todo_add Kitob o'qish")
+        await update.message.reply_text("Foydalanish: <code>/todo_add Kitob o'qish</code>", parse_mode=ParseMode.HTML)
         return
     task = " ".join(context.args)
     task_id = await TodoManager.add_task(update.effective_chat.id, task)
@@ -1212,12 +943,12 @@ async def cmd_todo_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def cmd_todo_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tasks = await TodoManager.list_tasks(update.effective_chat.id)
-    await update.message.reply_text(TodoManager.format_list(tasks), parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(TodoManager.format_list(tasks), parse_mode=ParseMode.HTML)
 
 
 async def cmd_todo_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Foydalanish: /todo_done <id>")
+        await update.message.reply_text("Foydalanish: <code>/todo_done id</code>", parse_mode=ParseMode.HTML)
         return
     await TodoManager.mark_done(update.effective_chat.id, int(context.args[0]))
     await update.message.reply_text("✅ Vazifa bajarilgan deb belgilandi.")
@@ -1225,38 +956,39 @@ async def cmd_todo_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def cmd_todo_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Foydalanish: /todo_del <id>")
+        await update.message.reply_text("Foydalanish: <code>/todo_del id</code>", parse_mode=ParseMode.HTML)
         return
     await TodoManager.delete_task(update.effective_chat.id, int(context.args[0]))
     await update.message.reply_text("🗑 Vazifa o'chirildi.")
 
 
-# ---- Yangiliklar ----
+# ---- Yangiliklar / kino / kitob / sport ----
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = " ".join(context.args) if context.args else "Uzbekistan"
+    target = update.effective_message
     articles = await news_service.get_news(query)
     if articles is None and not NEWSAPI_KEY:
-        await update.message.reply_text(
-            "⚠️ Yangiliklar xizmati sozlanmagan. .env faylida NEWSAPI_KEY ko'rsating "
-            "(https://newsapi.org saytidan bepul olish mumkin)."
+        await target.reply_text(
+            "⚠️ Yangiliklar xizmati sozlanmagan. .env faylida <code>NEWSAPI_KEY</code> ko'rsating "
+            "(https://newsapi.org — bepul).",
+            parse_mode=ParseMode.HTML,
         )
         return
-    await update.message.reply_text(
+    await target.reply_text(
         NewsService.format_message(articles or []), parse_mode=ParseMode.HTML, disable_web_page_preview=True
     )
 
 
-# ---- Kino ----
-
 async def cmd_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Foydalanish: /movie Inception")
+        await update.message.reply_text("Foydalanish: <code>/movie Inception</code>", parse_mode=ParseMode.HTML)
         return
     if not OMDB_API_KEY:
         await update.message.reply_text(
-            "⚠️ Kino xizmati sozlanmagan. .env faylida OMDB_API_KEY ko'rsating "
-            "(https://omdbapi.com saytidan bepul olish mumkin)."
+            "⚠️ Kino xizmati sozlanmagan. .env faylida <code>OMDB_API_KEY</code> ko'rsating "
+            "(https://omdbapi.com — bepul).",
+            parse_mode=ParseMode.HTML,
         )
         return
     title = " ".join(context.args)
@@ -1267,29 +999,25 @@ async def cmd_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(MovieService.format_message(movie), parse_mode=ParseMode.HTML)
 
 
-# ---- Kitoblar ----
-
 async def cmd_book(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     genre = " ".join(context.args) if context.args else "fiction"
+    target = update.effective_message
     books = await book_service.search_by_genre(genre)
-    await update.message.reply_text(BookService.format_message(books or [], genre), parse_mode=ParseMode.HTML)
+    await target.reply_text(BookService.format_message(books or [], genre), parse_mode=ParseMode.HTML)
 
-
-# ---- Sport ----
 
 async def cmd_sport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     league = context.args[0] if context.args else "epl"
+    target = update.effective_message
     if league.lower() not in SportsService.LEAGUE_IDS:
         available = ", ".join(SportsService.LEAGUE_IDS.keys())
-        await update.message.reply_text(f"⚠️ Noma'lum liga. Mavjud variantlar: {available}")
+        await target.reply_text(f"⚠️ Noma'lum liga. Mavjud: {available}")
         return
     results = await sports_service.get_last_results(league)
-    await update.message.reply_text(
-        SportsService.format_message(results or [], league), parse_mode=ParseMode.HTML
-    )
+    await target.reply_text(SportsService.format_message(results or [], league), parse_mode=ParseMode.HTML)
 
 
-# ---- Yaqin atrofdagi dorixona / do'kon ----
+# ---- Yaqin dorixona/do'kon ----
 
 async def cmd_nearby_pharmacy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _handle_nearby(update, context, "pharmacy")
@@ -1302,24 +1030,19 @@ async def cmd_nearby_shop(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def _handle_nearby(update: Update, context: ContextTypes.DEFAULT_TYPE, place_type: str) -> None:
     chat_id = update.effective_chat.id
     user = await get_user(chat_id)
+    target = update.effective_message
     if not user or not user.get("lat") or not user.get("lon"):
-        await update.message.reply_text(
-            "📍 Iltimos, avval joylashuvingizni yuboring (asosiy menyudagi tugma orqali)."
+        context.user_data["pending_location_action"] = place_type if place_type == "pharmacy" else "shop"
+        await target.reply_text(
+            "📍 Iltimos, avval joylashuvingizni yuboring:", reply_markup=location_request_keyboard()
         )
         return
     places = await place_finder_service.find_nearby(user["lat"], user["lon"], place_type)
-    await update.message.reply_text(
+    await target.reply_text(
         PlaceFinderService.format_message(places or [], place_type),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
-
-
-# ---- Sayohat ----
-
-async def cmd_travel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    destinations = TravelService.random_pick(3)
-    await update.message.reply_text(TravelService.format_message(destinations), parse_mode=ParseMode.HTML)
 
 
 # ---- Yo'l tirbandligi ----
@@ -1330,96 +1053,139 @@ async def cmd_traffic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(info)
 
 
-# ---- Kunlik obuna ----
+# ---- Obuna ----
 
 async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     await upsert_user(chat_id)
     await db_execute("UPDATE users SET subscribed_daily = 1 WHERE chat_id = ?", (chat_id,))
-    await update.message.reply_text(
-        f"✅ Kunlik xabarlarga obuna bo'ldingiz. Har kuni soat "
-        f"{DAILY_BROADCAST_HOUR:02d}:{DAILY_BROADCAST_MINUTE:02d} da ob-havo, "
-        "hikmatli so'z va fakt yuboriladi."
+    await update.effective_message.reply_text(
+        f"🔔 Obuna faollashtirildi! Har kuni soat "
+        f"<b>{DAILY_BROADCAST_HOUR:02d}:{DAILY_BROADCAST_MINUTE:02d}</b> da ob-havo, hikmat va fakt yuboriladi.",
+        parse_mode=ParseMode.HTML,
     )
 
 
 async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     await db_execute("UPDATE users SET subscribed_daily = 0 WHERE chat_id = ?", (chat_id,))
-    await update.message.reply_text("❌ Kunlik obuna bekor qilindi.")
+    await update.effective_message.reply_text("🔕 Obuna bekor qilindi.")
+
+
+# ---- Inline menyu callback router ----
+
+async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()  # yuklanish "soat" belgisini olib tashlaydi
+    data = query.data
+
+    if data == "menu:back":
+        await query.edit_message_text(WELCOME_TEXT, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
+        return
+
+    if data == "menu:weather":
+        await query.message.reply_text(
+            "🏙 Shahar nomini yozing: <code>/weather Toshkent</code>\nyoki joylashuvingizni yuboring:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=location_request_keyboard(),
+        )
+    elif data == "menu:clothing":
+        await cmd_weather(update, context)  # ob-havo bilan birga kiyim maslahati ham chiqadi
+    elif data == "menu:currency":
+        await cmd_currency(update, context)
+    elif data == "menu:news":
+        await cmd_news(update, context)
+    elif data == "menu:movie":
+        await query.message.reply_text("🎬 Kino nomini yozing: <code>/movie Inception</code>", parse_mode=ParseMode.HTML)
+    elif data == "menu:book":
+        await query.message.reply_text("📚 Janrni yozing: <code>/book fantasy</code>", parse_mode=ParseMode.HTML)
+    elif data == "menu:sport":
+        await query.message.reply_text(
+            "⚽️ Liga tanlang: <code>/sport epl</code> | laliga | uefa | seriea", parse_mode=ParseMode.HTML
+        )
+    elif data == "menu:travel":
+        await cmd_travel(update, context)
+    elif data == "menu:pharmacy":
+        await cmd_nearby_pharmacy(update, context)
+    elif data == "menu:shop":
+        await cmd_nearby_shop(update, context)
+    elif data == "menu:quote":
+        await cmd_quote(update, context)
+    elif data == "menu:translate":
+        await query.message.reply_text(
+            "💬 Foydalanish: <code>/translate en Salom, qandaysiz?</code>", parse_mode=ParseMode.HTML
+        )
+    elif data == "menu:todo":
+        await cmd_todo_list(update, context)
+    elif data == "menu:subscribe":
+        await cmd_subscribe(update, context)
+    elif data == "menu:help":
+        await query.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML, reply_markup=back_button())
+
+
+async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Oddiy matn (shahar nomi) yuborilganda ishlaydi — inline menyu asosiy navigatsiya."""
+    text = update.message.text.strip()
+    weather = await weather_service.get_by_city(text)
+    if weather:
+        await _send_weather_report(update.effective_chat, weather)
+    else:
+        await update.message.reply_text(
+            "🤔 Buni tushunmadim. Shahar nomi kiriting yoki menyudan foydalaning:",
+            reply_markup=main_menu_keyboard(),
+        )
 
 
 # =================================================================================
-# 20. KUNLIK AVTOMATIK XABAR (APScheduler)
+# 20. KUNLIK AVTOMATIK XABAR — PTB'ning O'Z ICHKI JobQueue'si orqali (XAVFSIZ)
 # =================================================================================
-
-async def send_daily_broadcast(application: Application) -> None:
-    """Barcha obuna bo'lgan foydalanuvchilarga har kuni ertalab xabar yuboradi."""
+#
+# MUHIM: Bu yerda ATAYLAB tashqi `apscheduler.AsyncIOScheduler` ISHLATILMAYDI,
+# chunki aynan o'sha yondashuv Render'da "no current event loop" xatoligiga
+# olib kelgan edi. `application.job_queue` PTB kutubxonasining o'zi tomonidan,
+# botning YAGONA asyncio event loop'i ichida ishga tushiriladi — shuning uchun
+# bunday muammo umuman yuzaga kelmaydi.
+#
+async def daily_broadcast_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     users = await get_all_subscribed_users()
-    logger.info("Kunlik xabar %d foydalanuvchiga yuborilmoqda...", len(users))
+    logger.info("📤 Kunlik xabar %d foydalanuvchiga yuborilmoqda...", len(users))
     quote = await quote_fact_service.get_quote()
     fact = await quote_fact_service.get_fact()
 
     for user in users:
         chat_id = user["chat_id"]
         try:
-            parts = [f"☀️ <b>Xayrli tong!</b>\n\n💡 {quote}\n\n🧠 {fact}"]
-
+            parts = [f"☀️ <b>Xayrli tong!</b>\n\n{quote}\n\n🧠 {fact}"]
             weather = None
             if user.get("city"):
                 weather = await weather_service.get_by_city(user["city"])
             elif user.get("lat") and user.get("lon"):
                 weather = await weather_service.get_by_coords(user["lat"], user["lon"])
-
             if weather:
                 parts.append(WeatherService.format_message(weather))
-                warnings = SafetyAdvisor.analyze(weather)
-                parts.append("\n".join(warnings))
+                parts.append("\n".join(SafetyAdvisor.analyze(weather)))
                 parts.append(f"👕 {ClothingAdvisor.suggest(weather)}")
 
-            await application.bot.send_message(
-                chat_id=chat_id, text="\n\n".join(parts), parse_mode=ParseMode.HTML
-            )
+            await context.bot.send_message(chat_id=chat_id, text="\n\n".join(parts), parse_mode=ParseMode.HTML)
         except TelegramError as e:
-            logger.warning("Foydalanuvchi %s ga xabar yuborib bo'lmadi: %s", chat_id, e)
-        await asyncio.sleep(0.05)  # Telegram rate-limit'iga hurmat
-
-
-def setup_scheduler(application: Application) -> AsyncIOScheduler:
-    scheduler = AsyncIOScheduler(timezone=TZ)
-    scheduler.add_job(
-        send_daily_broadcast,
-        trigger=CronTrigger(hour=DAILY_BROADCAST_HOUR, minute=DAILY_BROADCAST_MINUTE, timezone=TZ),
-        args=[application],
-        id="daily_broadcast",
-        replace_existing=True,
-    )
-    scheduler.start()
-    logger.info(
-        "Rejalashtiruvchi ishga tushdi. Kunlik xabar har kuni %02d:%02d (%s) da yuboriladi.",
-        DAILY_BROADCAST_HOUR, DAILY_BROADCAST_MINUTE, TIMEZONE_NAME,
-    )
-    return scheduler
+            logger.warning("Foydalanuvchi %s ga xabar yuborilmadi: %s", chat_id, e)
+        await asyncio.sleep(0.05)
 
 
 # =================================================================================
-# 21. ASOSIY FUNKSIYA (main)
+# 21. ASOSIY QURILISH VA ISHGA TUSHIRISH
 # =================================================================================
 
 def build_application() -> Application:
-    # O'ZGARISH: post_init funksiyasi to'g'ridan-to'g'ri Builder ichida chaqiriladi
-    application = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Asosiy komandalar
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
 
-    # Ob-havo
     application.add_handler(CommandHandler("weather", cmd_weather))
     application.add_handler(CommandHandler("setcity", cmd_setcity))
     application.add_handler(MessageHandler(filters.LOCATION, on_location_received))
 
-    # Valyuta / yangiliklar / kino / kitob / sport / sayohat / tirbandlik
     application.add_handler(CommandHandler("currency", cmd_currency))
     application.add_handler(CommandHandler("news", cmd_news))
     application.add_handler(CommandHandler("movie", cmd_movie))
@@ -1428,54 +1194,51 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("travel", cmd_travel))
     application.add_handler(CommandHandler("traffic", cmd_traffic))
 
-    # Fakt / iqtibos / tarjimon
     application.add_handler(CommandHandler("quote", cmd_quote))
     application.add_handler(CommandHandler("fact", cmd_quote))
     application.add_handler(CommandHandler("translate", cmd_translate))
 
-    # To-do
     application.add_handler(CommandHandler("todo_add", cmd_todo_add))
     application.add_handler(CommandHandler("todo_list", cmd_todo_list))
     application.add_handler(CommandHandler("todo_done", cmd_todo_done))
     application.add_handler(CommandHandler("todo_del", cmd_todo_del))
 
-    # Obuna
     application.add_handler(CommandHandler("subscribe", cmd_subscribe))
     application.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
 
-    # Nearby (dorixona/do'kon) — to'g'ridan-to'g'ri komanda sifatida ham
     application.add_handler(CommandHandler("pharmacy", cmd_nearby_pharmacy))
     application.add_handler(CommandHandler("shop", cmd_nearby_shop))
 
-    # Oddiy matn xabarlari (menyu tugmalari + shahar nomlari)
+    application.add_handler(CallbackQueryHandler(on_callback_query, pattern=r"^menu:"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_message))
 
-    # Xatoliklarni ushlash
     application.add_error_handler(on_error)
-
     return application
 
 
 async def post_init(application: Application) -> None:
-    """Bot ishga tushgandan so'ng chaqiriladigan tayyorgarlik funksiyasi."""
+    """Bot ishga tushgach chaqiriladi: baza tayyorlanadi va kunlik job rejalashtiriladi."""
     init_database()
-    setup_scheduler(application)
-    logger.info("Bot muvaffaqiyatli ishga tushdi.")
+    # PTB'ning o'z JobQueue'si — hech qanday tashqi event-loop muammosisiz ishlaydi
+    application.job_queue.run_daily(
+        daily_broadcast_job,
+        time=dtime(hour=DAILY_BROADCAST_HOUR, minute=DAILY_BROADCAST_MINUTE, tzinfo=TZ),
+        name="daily_broadcast",
+    )
+    logger.info(
+        "🚀 Bot muvaffaqiyatli ishga tushdi. Kunlik xabar har kuni %02d:%02d (%s) da yuboriladi.",
+        DAILY_BROADCAST_HOUR, DAILY_BROADCAST_MINUTE, TIMEZONE_NAME,
+    )
 
 
 def main() -> None:
     application = build_application()
-    logger.info("Bot ishga tushmoqda...")
-    
-    # O'ZGARISH: Render muhiti taqdim etadigan portni aniqlaymiz (standart 10000)
-    PORT = int(os.environ.get('PORT', '10000'))
-    
-    # O'ZGARISH: Render Web Service uchun webhook orqali ishga tushirish
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        webhook_url=f"https://obhavo-y8em.onrender.com/{BOT_TOKEN}"
-    )
+    application.post_init = post_init
+    logger.info("⏳ Bot ishga tushmoqda...")
+    # MUHIM: faqat run_polling ishlatiladi — hech qanday webhook/start_webhook chaqirilmaydi.
+    # drop_pending_updates=True — qayta ishga tushganda eski/osilib qolgan yangilanishlarni tashlab yuboradi
+    # (bu ham "Conflict"/eventloop bilan bog'liq g'alati holatlarning oldini oladi).
+    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
