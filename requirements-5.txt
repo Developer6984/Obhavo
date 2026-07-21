@@ -1,0 +1,14 @@
+# ==== Telegram bot asosiy kutubxonasi (job-queue MUHIM — kunlik xabar shu orqali ishlaydi) ====
+python-telegram-bot[job-queue]==21.4
+
+# ==== HTTP so'rovlar ====
+requests==2.32.3
+
+# ==== Muhit o'zgaruvchilari (.env) ====
+python-dotenv==1.0.1
+
+# ==== Vaqt zonalari ====
+pytz==2024.1
+
+# ==== Avtomatik tarjimon ====
+deep-translator==1.11.4
