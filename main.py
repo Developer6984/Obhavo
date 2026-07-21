@@ -1407,7 +1407,8 @@ def setup_scheduler(application: Application) -> AsyncIOScheduler:
 # =================================================================================
 
 def build_application() -> Application:
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    # O'ZGARISH: post_init funksiyasi to'g'ridan-to'g'ri Builder ichida chaqiriladi
+    application = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     # Asosiy komandalar
     application.add_handler(CommandHandler("start", cmd_start))
@@ -1464,9 +1465,17 @@ async def post_init(application: Application) -> None:
 
 def main() -> None:
     application = build_application()
-    application.post_init = post_init
     logger.info("Bot ishga tushmoqda...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    
+    # O'ZGARISH: Render muhiti taqdim etadigan portni aniqlaymiz (standart 10000)
+    PORT = int(os.environ.get('PORT', '10000'))
+    
+    # O'ZGARISH: Render Web Service uchun webhook orqali ishga tushirish
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        webhook_url=f"https://obhavo-y8em.onrender.com/{BOT_TOKEN}"
+    )
 
 
 if __name__ == "__main__":
